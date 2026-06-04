@@ -37,9 +37,30 @@ const environment = process.env.QUICKBOOKS_ENVIRONMENT || 'sandbox';
 // Fix for Issue #5: Use env var with underscore (QUICKBOOKS_REDIRECT_URI)
 const redirect_uri = process.env.QUICKBOOKS_REDIRECT_URI || 'http://localhost:8000/callback';
 
-// Only throw error if client_id or client_secret is missing
-if (!client_id || !client_secret || !redirect_uri) {
-  throw Error("Client ID, Client Secret and Redirect URI must be set in environment variables");
+// ── External token mode ──────────────────────────────────────────────────────
+// When QUICKBOOKS_EXTERNAL_TOKEN_FILE is set, the server reads short-lived
+// access tokens from that file (JSON: { access_token, expires_at }) on every
+// freshness check, instead of running its own OAuth refresh flow. This lets
+// an external broker (e.g. Nango) own refresh-token lifecycle while this
+// server stays stateless on auth — survives container restarts without re-
+// authentication, and several MCP servers can share one upstream OAuth app.
+//
+// When set:
+//   - Client ID, Client Secret, and Refresh Token become optional (the local
+//     OAuth flow is unreachable).
+//   - QUICKBOOKS_REALM_ID is still required (Nango's connection payload does
+//     not include it).
+//   - The server still calls QBO's API directly; only the access-token
+//     acquisition path is external.
+const external_token_file = process.env.QUICKBOOKS_EXTERNAL_TOKEN_FILE;
+const externalTokenMode = Boolean(external_token_file);
+
+if (externalTokenMode) {
+  if (!realm_id) {
+    throw Error("QUICKBOOKS_EXTERNAL_TOKEN_FILE is set but QUICKBOOKS_REALM_ID is missing — realm id is required in external-token mode");
+  }
+} else if (!client_id || !client_secret || !redirect_uri) {
+  throw Error("Client ID, Client Secret and Redirect URI must be set in environment variables (or set QUICKBOOKS_EXTERNAL_TOKEN_FILE to use externally-managed tokens)");
 }
 
 // ── QuickbooksClient ─────────────────────────────────────────────────────────
@@ -58,6 +79,13 @@ export class QuickbooksClient {
   private oauthClient: OAuthClient;
   private isAuthenticating: boolean = false;
   private redirectUri: string;
+  // When set, the client reads access tokens from this file on every freshness
+  // check instead of running its own refresh flow. See module-level comment.
+  private externalTokenFile?: string;
+  // Last access_token value loaded from the external file. Used to detect
+  // rotation so we only rebuild the underlying QuickBooks instance when the
+  // token actually changes.
+  private externalLoadedToken?: string;
 
   // Refresh 5 minutes before actual expiry to avoid edge cases
   private static readonly TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
@@ -79,6 +107,7 @@ export class QuickbooksClient {
     realmId?: string;
     environment: string;
     redirectUri: string;
+    externalTokenFile?: string;
   }) {
     this.clientId = config.clientId;
     this.clientSecret = config.clientSecret;
@@ -86,6 +115,7 @@ export class QuickbooksClient {
     this.realmId = config.realmId;
     this.environment = config.environment;
     this.redirectUri = config.redirectUri;
+    this.externalTokenFile = config.externalTokenFile;
     this.oauthClient = new OAuthClient({
       clientId: this.clientId,
       clientSecret: this.clientSecret,
@@ -97,6 +127,38 @@ export class QuickbooksClient {
   private isTokenExpiredOrExpiringSoon(): boolean {
     if (!this.accessToken || !this.accessTokenExpiry) return true;
     return this.accessTokenExpiry <= new Date(Date.now() + QuickbooksClient.TOKEN_REFRESH_BUFFER_MS);
+  }
+
+  // Read access token from the external broker file (e.g. Nango feeder).
+  // The file shape is: { "access_token": string, "expires_at": ISO-8601 string }
+  // Returns true if the loaded token differs from the previously-loaded one
+  // (caller uses this to know whether to rebuild the QuickBooks instance).
+  private loadExternalAccessToken(): boolean {
+    if (!this.externalTokenFile) {
+      throw new Error('loadExternalAccessToken called but externalTokenFile is unset');
+    }
+    const raw = fs.readFileSync(this.externalTokenFile, 'utf-8');
+    let parsed: { access_token?: string; expires_at?: string };
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      throw new Error(`External token file ${this.externalTokenFile} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (!parsed.access_token || !parsed.expires_at) {
+      throw new Error(`External token file ${this.externalTokenFile} missing access_token or expires_at`);
+    }
+    const expiry = new Date(parsed.expires_at);
+    if (Number.isNaN(expiry.getTime())) {
+      throw new Error(`External token file ${this.externalTokenFile} has invalid expires_at: ${parsed.expires_at}`);
+    }
+    if (expiry <= new Date(Date.now() + QuickbooksClient.TOKEN_REFRESH_BUFFER_MS)) {
+      throw new Error(`External token file ${this.externalTokenFile} is stale (expires_at=${parsed.expires_at}). The token broker (e.g. Nango feeder) is not refreshing on time.`);
+    }
+    const changed = this.externalLoadedToken !== parsed.access_token;
+    this.accessToken = parsed.access_token;
+    this.accessTokenExpiry = expiry;
+    this.externalLoadedToken = parsed.access_token;
+    return changed;
   }
 
   private async startOAuthFlow(): Promise<void> {
@@ -233,17 +295,19 @@ export class QuickbooksClient {
     if (this.refreshToken) updateEnvVar('QUICKBOOKS_REFRESH_TOKEN', this.refreshToken);
     if (this.realmId) updateEnvVar('QUICKBOOKS_REALM_ID', this.realmId);
 
-    // Atomic write: write to a sibling temp file, then rename. On POSIX rename
-    // is atomic within the same filesystem, so a crash mid-write cannot leave
-    // .env half-written or empty.
-    const tmpPath = `${tokenPath}.tmp.${process.pid}`;
-    try {
-      fs.writeFileSync(tmpPath, envLines.join('\n'), { mode: 0o600 });
-      fs.renameSync(tmpPath, tokenPath);
-    } catch (err) {
-      try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
-      throw err;
-    }
+    // In-place write. We previously used tmp+rename for atomicity, but that
+    // pattern fails when .env is a single-file bind mount (Docker / Kubernetes
+    // secret subPath / similar): rename onto a mount point returns EBUSY on
+    // Linux and silently leaves the host file unchanged. In-place writeFileSync
+    // updates the inode in place and propagates to the host.
+    //
+    // The atomicity tradeoff is small for a short, well-known env file: the
+    // write is a single syscall on the file's data block (a few hundred bytes
+    // at most). Worst case on a crash mid-write is a truncated .env on the
+    // next startup, which throws cleanly rather than producing garbage. If you
+    // need strict atomicity and don't use a bind mount, bind-mount the parent
+    // directory instead — then tmp+rename in the same dir would work.
+    fs.writeFileSync(tokenPath, envLines.join('\n'), { mode: 0o600 });
   }
 
   async refreshAccessToken() {
@@ -325,7 +389,37 @@ export class QuickbooksClient {
     }
 
     this.authInFlight = (async () => {
+      // Force at least one microtask yield BEFORE the synchronous body runs.
+      // Without this, when the body is fully synchronous (external-token mode),
+      // the finally block can fire before the caller's `this.authInFlight = ...`
+      // assignment completes, leaving the field stuck pointing at the resolved
+      // promise after subsequent calls. The yield ensures the assignment in the
+      // caller completes first; the finally then correctly clears the field.
+      await Promise.resolve();
       try {
+        if (this.externalTokenFile) {
+          // External-token mode: read fresh access_token from the broker file.
+          // Realm ID was validated to be present at module load. Client ID and
+          // Client Secret are passed through to node-quickbooks but unused for
+          // refresh (the broker owns that).
+          const tokenChanged = this.loadExternalAccessToken();
+          if (!this.quickbooksInstance || tokenChanged) {
+            this.quickbooksInstance = new QuickBooks(
+              this.clientId || '',
+              this.clientSecret || '',
+              this.accessToken!,
+              false,
+              this.realmId!,
+              this.environment === 'sandbox',
+              false,
+              null,
+              '2.0',
+              this.refreshToken
+            );
+          }
+          return this.quickbooksInstance;
+        }
+
         if (!this.refreshToken || !this.realmId) {
           await this.startOAuthFlow();
 
@@ -366,7 +460,16 @@ export class QuickbooksClient {
   // ── Called by every handler on every request ─────────────────────────────
   // Checks token freshness on each invocation so handlers stay functional
   // across 60-minute token boundaries without server restarts.
+  //
+  // In external-token mode, authenticate() always re-reads the broker file,
+  // so we ALWAYS call authenticate() to pick up rotations. The function is
+  // cheap when nothing changed (one filesystem read + one JSON.parse; the
+  // QuickBooks instance is reused unless the token actually rotated).
   static async getInstance(): Promise<QuickBooks> {
+    if (quickbooksClient.externalTokenFile) {
+      await quickbooksClient.authenticate();
+      return quickbooksClient.quickbooksInstance!;
+    }
     if (quickbooksClient.isTokenExpiredOrExpiringSoon()) {
       await quickbooksClient.authenticate();
     }
@@ -381,7 +484,10 @@ export class QuickbooksClient {
   // (e.g. POST /upload for binary attachments). Ensures token freshness on
   // every invocation, same as getInstance().
   static async getAuthCredentials(): Promise<{ accessToken: string; realmId: string; isSandbox: boolean }> {
-    if (quickbooksClient.isTokenExpiredOrExpiringSoon() || !quickbooksClient.accessToken) {
+    if (quickbooksClient.externalTokenFile) {
+      // External-token mode: always re-read on call.
+      await quickbooksClient.authenticate();
+    } else if (quickbooksClient.isTokenExpiredOrExpiringSoon() || !quickbooksClient.accessToken) {
       await quickbooksClient.authenticate();
     }
     if (!quickbooksClient.accessToken || !quickbooksClient.realmId) {
@@ -403,10 +509,11 @@ export class QuickbooksClient {
 }
 
 export const quickbooksClient = new QuickbooksClient({
-  clientId: client_id,
-  clientSecret: client_secret,
+  clientId: client_id || '',
+  clientSecret: client_secret || '',
   refreshToken: refresh_token,
   realmId: realm_id,
   environment: environment,
   redirectUri: redirect_uri,
+  externalTokenFile: external_token_file,
 });
