@@ -1,6 +1,7 @@
 import { QuickbooksClient } from "../clients/quickbooks-client.js";
 import { ToolResponse } from "../types/tool-response.js";
 import { formatError } from "../helpers/format-error.js";
+import { normalizeParentRef } from "../helpers/account-ref.js";
 
 export interface UpdateAccountInput {
   account_id: string;
@@ -24,16 +25,6 @@ const updateFieldTypeMap: Record<string, "string" | "boolean" | "number"> = {
   SubAccount: "boolean",
   CurrentBalance: "number",
 };
-
-// Coerce ParentRef into the QBO reference-object shape { value: "<id>" }.
-// Accepts: { value: "307" } (canonical), "307" (bare string), or 307 (number).
-function normalizeParentRef(value: any): { value: string } | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value === "object" && value.value !== undefined) {
-    return { value: String(value.value) };
-  }
-  return { value: String(value) };
-}
 
 function normalizePatch(patch: Record<string, any>): Record<string, any> {
   const normalized: Record<string, any> = {};

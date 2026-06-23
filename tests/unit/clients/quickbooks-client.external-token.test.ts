@@ -16,12 +16,22 @@ import os from 'os';
 import path from 'path';
 
 // Stub the required module-level env vars BEFORE importing the client.
-// The client throws on import if these are missing.
-process.env.QUICKBOOKS_CLIENT_ID = process.env.QUICKBOOKS_CLIENT_ID || 'test-client-id';
-process.env.QUICKBOOKS_CLIENT_SECRET = process.env.QUICKBOOKS_CLIENT_SECRET || 'test-client-secret';
-process.env.QUICKBOOKS_REDIRECT_URI = process.env.QUICKBOOKS_REDIRECT_URI || 'http://localhost:8000/callback';
+// The client validates env at import time and throws if a required var is
+// missing. Set deterministically so test-suite ordering in the shared Jest
+// process can't leave a stale value that trips the import-time guard.
+//
+// CRITICAL: the client must be imported with a DYNAMIC `await import()` AFTER
+// these assignments. A static top-of-file `import` is hoisted by the ESM loader
+// to run before these statements, so the client's module-level env validation
+// would execute with the vars still unset and throw. (Upstream's auth test uses
+// the same dynamic-import-after-env pattern.)
+process.env.QUICKBOOKS_CLIENT_ID = 'test-client-id';
+process.env.QUICKBOOKS_CLIENT_SECRET = 'test-client-secret';
+process.env.QUICKBOOKS_REDIRECT_URI = 'http://localhost:8000/callback';
+process.env.QUICKBOOKS_REALM_ID = '12345';
+process.env.QUICKBOOKS_ENVIRONMENT = 'sandbox';
 
-import { QuickbooksClient } from '../../../src/clients/quickbooks-client.js';
+const { QuickbooksClient } = await import('../../../src/clients/quickbooks-client.js');
 
 describe('QuickbooksClient external-token mode', () => {
   let tokenFile: string;

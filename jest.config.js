@@ -32,6 +32,26 @@ export default {
       lines: 70,
       statements: 70,
     },
+    // The account handlers carry an inherited scalar field-type-map switch
+    // (string/boolean/number/default arms). create_account's fixed payload only
+    // ever feeds string fields plus the ParentRef object (handled outside the
+    // map), so its boolean/number/default arms aren't reachable from the public
+    // surface. account.handlers.test.ts covers the reachable paths (top-level
+    // create, sub-account create via parent_id, re-parent via update, scalar
+    // coercion, error propagation). These floors reflect reachable coverage
+    // rather than instrumenting dead arms.
+    './src/handlers/create-quickbooks-account.handler.ts': {
+      branches: 55,
+      functions: 100,
+      lines: 75,
+      statements: 75,
+    },
+    './src/handlers/update-quickbooks-account.handler.ts': {
+      branches: 90,
+      functions: 100,
+      lines: 95,
+      statements: 95,
+    },
   },
   moduleNameMapper: {
     '^(\\.{1,2}/.*)\\.js$': '$1',

@@ -1,15 +1,24 @@
 import { QuickbooksClient } from "../clients/quickbooks-client.js";
 import { ToolResponse } from "../types/tool-response.js";
 import { formatError } from "../helpers/format-error.js";
+import { normalizeParentRef } from "../helpers/account-ref.js";
 
 export interface CreateAccountInput {
   name: string;
   type: string; // e.g., Expense, Income, Bank, etc.
   sub_type?: string;
   description?: string;
+  // When set, create the account as a sub-account of this parent (the parent's
+  // Id, e.g. "307"). SubAccount:true and ParentRef:{value:parent_id} are sent.
+  // The new account's AccountType must match the parent's or QBO rejects it.
+  parent_id?: string;
 }
 
-// Helper to normalize field values to the correct data type expected by Quickbooks
+// Helper to normalize field values to the correct data type expected by Quickbooks.
+// NOTE: ParentRef is intentionally NOT in this scalar map — it is a QBO nested
+// reference object ({ value: "<id>" }), and String()-coercing it yields the
+// literal "[object Object]" (QBO error 2010). ParentRef is built separately via
+// normalizeParentRef() below.
 const accountFieldTypeMap: Record<string, "string" | "boolean" | "number"> = {
   Name: "string",
   AccountType: "string",
@@ -18,7 +27,6 @@ const accountFieldTypeMap: Record<string, "string" | "boolean" | "number"> = {
   Classification: "string",
   Active: "boolean",
   SubAccount: "boolean",
-  ParentRef: "string",
   CurrentBalance: "number",
 };
 
@@ -63,6 +71,15 @@ export async function createQuickbooksAccount(data: CreateAccountInput): Promise
     };
 
     const payload = normalizeAccountPayload(basePayload);
+
+    // Sub-account creation: when a parent is supplied, mark SubAccount:true and
+    // attach the ParentRef reference object. Built after normalization so the
+    // nested ParentRef object is not run through the scalar field-type map.
+    const parentRef = normalizeParentRef(data.parent_id);
+    if (parentRef) {
+      payload.SubAccount = true;
+      payload.ParentRef = parentRef;
+    }
 
     return new Promise((resolve) => {
       (quickbooks as any).createAccount(payload, (err: any, account: any) => {
